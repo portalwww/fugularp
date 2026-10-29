@@ -1,0 +1,154 @@
+# port-target.yml — run port.py on a GitHub runner instead of a local Linux box.
+#
+# The runner already has a real Linux kernel + root, so payload-dumper-go / debugfs (e2fsprogs) /
+# vmlinux-to-elf / llvm-* all work — no WSL, MSVC or admin rights needed on your PC.
+#
+# How to use:
+#   1. Put the OTA zip on THIS repo as a Release asset (Releases -> Draft a new release ->
+#      tag e.g. "ota" -> attach q2_<build>.zip). Release assets may be up to 2 GB; plain git
+#      commits may not (100 MB limit) and *.zip / *.bin are gitignored anyway.
+#   2. Actions -> "port-target" -> Run workflow -> fill in the inputs -> Run.
+#   3. Download the "target-<name>" artifact. It holds targets/<name>.json + targets/<name>/
+#      (carrier .ko, init.insmod.cfg). Copy those into your working tree and commit.
+#
+# Typical Q2 (recent 4.19.325 build) args, which is the default below:
+#   --merged --carrier rdbg --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off auto
+# QPro:      same flags (--cred-off 0x7e8)
+# Q3 two-carrier: leave port_args empty (defaults: llcc_perfmon + usbip-vudc + libeva.so)
+
+name: port-target
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'OTA zip filename (the release asset name)'
+        required: true
+        default: 'q2_52322490019200150.zip'
+      release_tag:
+        description: 'Release tag on this repo that holds the zip'
+        required: false
+        default: 'ota'
+      zip_url:
+        description: 'Direct URL to the zip (overrides release_tag when set)'
+        required: false
+        default: ''
+      port_args:
+        description: 'extra port.py arguments'
+        required: false
+        default: '--merged --carrier rdbg --inject-lib libgralloc.qti.so --enforcing-off 1 --cred-off auto'
+
+permissions:
+  contents: read
+
+jobs:
+  port:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350          # vmlinux-to-elf on a 4.19 kernel can take 10-20 min; dump adds more
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu runners start with ~14 GB free; the OTA (1.1 GB) + system/vendor images (~3-4 GB)
+      # fit, but freeing the preinstalled toolchains keeps a wide margin for the dump + vmlinux.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install port toolchain
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs llvm python3-pip curl
+          # the `llvm` metapackage may only ship versioned names; toolconf.py looks for the bare ones
+          for t in llvm-readelf llvm-nm llvm-objdump; do
+            [ -e "/usr/bin/$t" ] || sudo ln -sf "/usr/bin/$t-18" "/usr/bin/$t"
+          done
+          # vmlinux-to-elf (builds minilzo; gcc is on the image)
+          sudo python3 -m pip install --break-system-packages -r requirements-port.txt
+          # payload-dumper-go 2.1.0 (linux_amd64); tarball unpacks the binary at the top level
+          curl -fsSL -o /tmp/pdg.tgz \
+            https://github.com/ssut/payload-dumper-go/releases/download/2.1.0/payload-dumper-go_2.1.0_linux_amd64.tar.gz
+          mkdir -p "$HOME/Tools/payload-dumper-go"
+          tar -xzf /tmp/pdg.tgz -C "$HOME/Tools/payload-dumper-go"
+          chmod +x "$HOME/Tools/payload-dumper-go/payload-dumper-go"
+
+      - name: Point toolconf.py at the installed tools
+        run: |
+          set -euo pipefail
+          DEBUGFS="$(command -v debugfs || true)"; DEBUGFS="${DEBUGFS:-/usr/sbin/debugfs}"
+          VMLINUX_TO_ELF="$(command -v vmlinux-to-elf || true)"; VMLINUX_TO_ELF="${VMLINUX_TO_ELF:-/usr/local/bin/vmlinux-to-elf}"
+          {
+            echo "PAYLOAD_DUMPER=$HOME/Tools/payload-dumper-go/payload-dumper-go"
+            echo "DEBUGFS=$DEBUGFS"
+            echo "VMLINUX_TO_ELF=$VMLINUX_TO_ELF"
+          } >> "$GITHUB_ENV"
+          cat "$GITHUB_ENV"
+
+      - name: Verify toolchain (same check as SETUP.md)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, shutil, sys
+          sys.path.insert(0, ".")
+          import toolconf as t
+          bad = []
+          for lbl, p in [("payload-dumper-go", t.PDG), ("debugfs", t.DEBUGFS),
+                         ("vmlinux-to-elf", t.VMLINUX_TO_ELF), ("llvm-readelf", t.READELF),
+                         ("llvm-nm", t.NM), ("llvm-objdump", t.OBJDUMP)]:
+              ok = os.path.isfile(p) or shutil.which(p)
+              print(f"  {'OK ' if ok else 'MISSING'} {lbl}: {p}")
+              if not ok: bad.append(lbl)
+          sys.exit(1 if bad else 0)
+          PY
+          df -h / | tail -1
+
+      - name: Fetch OTA zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.zip_url }}" ]; then
+            curl -fL --retry 3 -o "${{ inputs.zip_name }}" "${{ inputs.zip_url }}"
+          else
+            gh release download "${{ inputs.release_tag }}" \
+              --pattern "${{ inputs.zip_name }}" --dir . --clobber
+          fi
+          ls -lh "${{ inputs.zip_name }}"
+
+      - name: Run port.py
+        run: |
+          set -euo pipefail
+          python3 port.py --zip "${{ inputs.zip_name }}" ${{ inputs.port_args }}
+
+      - name: Show + summarize the emitted target
+        run: |
+          set -euo pipefail
+          name="$(basename "${{ inputs.zip_name }}" .zip)"
+          echo "TARGET_NAME=$name" >> "$GITHUB_ENV"
+          echo "--- targets/$name.json ---"
+          cat "targets/$name.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "--- targets/$name/ ---"
+          ls -l "targets/$name" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload target
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-${{ env.TARGET_NAME }}
+          path: |
+            targets/${{ env.TARGET_NAME }}.json
+            targets/${{ env.TARGET_NAME }}/
+          if-no-files-found: error
+
+      # Diagnostic only (the images are GB-sized, so don't upload them): what the last run left behind.
+      - name: Dump scratch dir on failure
+        if: failure()
+        run: |
+          df -h /
+          find build targets -maxdepth 2 -type f -printf '%10s  %p\n' 2>/dev/null | sort -k2 | tail -40
