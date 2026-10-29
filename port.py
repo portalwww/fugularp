@@ -28,12 +28,28 @@ R_AARCH64_CALL26 = 0x11b
 def run(args): return subprocess.run(args, capture_output=True, text=True).stdout   # arg list, no shell (OS-independent)
 def die(m): print("ERROR:", m); sys.exit(1)
 
+def payload_partition_names(payload):
+    # pdg -l prints "Found partitions: abl (274 kB), aop (205 kB), ...". Needed because pdg >= 2.1
+    # aborts the *entire* dump (exit 1, nothing extracted) when asked for a partition the OTA lacks —
+    # Q2/QPro payloads have no vendor_dlkm, and Q2 5232249xxxxxxx also has no system_dlkm/odm_dlkm.
+    out = run([PDG, "-l", payload])
+    tail = out.split("Found partitions:", 1)[-1]
+    return set(re.findall(r"([A-Za-z0-9_]+) \([^)]*\)", tail))
+
 def dump_partitions(zippath, workdir, parts):
     import zipfile                                          # extract payload.bin cross-OS (no `unzip`)
     with zipfile.ZipFile(zippath) as z:
         z.extract("payload.bin", workdir)
-    subprocess.run([PDG, "-p", ",".join(parts), "-o", workdir,
-                    os.path.join(workdir, "payload.bin")], capture_output=True)
+    pb = os.path.join(workdir, "payload.bin")
+    avail = payload_partition_names(pb)                     # only ask for what this OTA actually ships
+    if avail:
+        skip = [p for p in parts if p not in avail]
+        if skip: print("    not in this payload, skipped: " + ",".join(skip))
+        parts = [p for p in parts if p in avail]
+        if not parts: die("none of the wanted partitions are in payload.bin (have: " + ",".join(sorted(avail)) + ")")
+    r = subprocess.run([PDG, "-p", ",".join(parts), "-o", workdir, pb], capture_output=True, text=True)
+    if r.returncode != 0:                                   # used to be ignored -> "carrier not found"
+        die(f"payload-dumper-go failed (exit {r.returncode}):\n" + (r.stderr or r.stdout or "").strip()[-2000:])
 
 def debugfs_dump(img, inner, outp):
     subprocess.run([DEBUGFS, "-R", f"dump {inner} {outp}", img], capture_output=True)
