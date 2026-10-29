@@ -51,19 +51,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ubuntu runners start with ~14 GB free; the OTA (1.1 GB) + system/vendor images (~3-4 GB)
-      # fit, but freeing the preinstalled toolchains keeps a wide margin for the dump + vmlinux.
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
       - name: Install port toolchain
         run: |
           set -euxo pipefail
@@ -171,14 +158,10 @@ jobs:
           df -h /
           find build targets -maxdepth 2 -type f -printf '%10s  %p\n' 2>/dev/null | sort -k2 | tail -40
 
-      # Runs even when port.py fails: drop the ~1.1 GB OTA zip and port.py's dumped images so the
-      # workspace stays clean. The target itself is already in the artifact above.
-      - name: Delete downloaded OTA zip + scratch images
+      # Runs even when port.py fails: drop the ~1.1 GB OTA zip. The target itself is already in the
+      # artifact above; port.py removes its own build/port_* workdir when it exits.
+      - name: Delete downloaded OTA zip
         if: always()
         env:
           ZIP_NAME: ${{ inputs.zip_name }}
-        run: |
-          rm -fv "$ZIP_NAME"
-          rm -rfv build/port_* 2>/dev/null || true
-          rmdir build 2>/dev/null || true
-          df -h / | tail -1
+        run: rm -fv "$ZIP_NAME"
